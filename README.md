@@ -1,2 +1,845 @@
 # AGE
 Any Goods Exchange
+// ========================
+// BACKEND - Server Setup (server.js)
+// ========================
+
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const multer = require('multer');
+const { Server } = require('socket.io');
+const http = require('http');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const nodemailer = require('nodemailer');
+require('dotenv').config();
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: process.env.FRONTEND_URL || "http://localhost:3000" }
+});
+
+// Middleware
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// MongoDB Connection
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/age_exchange', {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+});
+
+// ========================
+// SCHEMAS & MODELS
+// ========================
+
+// User Schema
+const userSchema = new mongoose.Schema({
+  email: { type: String, required: true, unique: true },
+  password: { type: String, required: function() { return !this.socialId; } },
+  name: { type: String, required: true },
+  avatar: { type: String, default: '' },
+  bio: { type: String, default: '' },
+  badges: [{ type: String }],
+  socialId: { type: String }, // for OAuth
+  provider: { type: String, enum: ['local', 'google', 'facebook'] },
+  role: { type: String, enum: ['user', 'admin'], default: 'user' },
+  isPremium: { type: Boolean, default: false },
+  premiumExpiry: { type: Date },
+  rating: { type: Number, default: 0 },
+  totalRatings: { type: Number, default: 0 },
+  profileCompletion: { type: Number, default: 20 },
+  isActive: { type: Boolean, default: true },
+  lastSeen: { type: Date, default: Date.now },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+});
+
+const User = mongoose.model('User', userSchema);
+
+// Listing Schema
+const listingSchema = new mongoose.Schema({
+  title: { type: String, required: true },
+  description: { type: String, required: true },
+  images: [{ type: String }],
+  video: { type: String },
+  category: { type: String, required: true },
+  tags: [{ type: String }],
+  condition: { type: String, enum: ['new', 'like-new', 'good', 'fair', 'poor'], required: true },
+  exchangePreferences: [{ type: String }],
+  location: {
+    city: String,
+    state: String,
+    country: String,
+    coordinates: {
+      lat: Number,
+      lng: Number
+    }
+  },
+  owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  status: { type: String, enum: ['active', 'traded', 'inactive'], default: 'active' },
+  views: { type: Number, default: 0 },
+  likes: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+});
+
+const Listing = mongoose.model('Listing', listingSchema);
+
+// Trade Schema
+const tradeSchema = new mongoose.Schema({
+  requester: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  requesterItem: { type: mongoose.Schema.Types.ObjectId, ref: 'Listing', required: true },
+  ownerItem: { type: mongoose.Schema.Types.ObjectId, ref: 'Listing', required: true },
+  status: { type: String, enum: ['pending', 'approved', 'declined', 'completed', 'cancelled'], default: 'pending' },
+  message: { type: String },
+  meetingDetails: {
+    location: String,
+    date: Date,
+    notes: String
+  },
+  chatRoom: { type: String, unique: true },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+});
+
+const Trade = mongoose.model('Trade', tradeSchema);
+
+// Message Schema
+const messageSchema = new mongoose.Schema({
+  tradeId: { type: mongoose.Schema.Types.ObjectId, ref: 'Trade', required: true },
+  sender: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  content: { type: String, required: true },
+  type: { type: String, enum: ['text', 'image', 'file'], default: 'text' },
+  readBy: [{
+    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    readAt: { type: Date, default: Date.now }
+  }],
+  createdAt: { type: Date, default: Date.now }
+});
+
+const Message = mongoose.model('Message', messageSchema);
+
+// Review Schema
+const reviewSchema = new mongoose.Schema({
+  trade: { type: mongoose.Schema.Types.ObjectId, ref: 'Trade', required: true },
+  reviewer: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  reviewed: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  rating: { type: Number, required: true, min: 1, max: 5 },
+  comment: { type: String },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const Review = mongoose.model('Review', reviewSchema);
+
+// Notification Schema
+const notificationSchema = new mongoose.Schema({
+  recipient: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  sender: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  type: { type: String, enum: ['trade_request', 'trade_approved', 'trade_declined', 'message', 'review'], required: true },
+  title: { type: String, required: true },
+  message: { type: String, required: true },
+  data: { type: mongoose.Schema.Types.Mixed },
+  read: { type: Boolean, default: false },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const Notification = mongoose.model('Notification', notificationSchema);
+
+// ========================
+// MIDDLEWARE
+// ========================
+
+const authMiddleware = async (req, res, next) => {
+  try {
+    const token = req.header('Authorization')?.replace('Bearer ', '');
+    if (!token) {
+      return res.status(401).json({ error: 'Access denied. No token provided.' });
+    }
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const user = await User.findById(decoded.userId);
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid token.' });
+    }
+    
+    req.user = user;
+    next();
+  } catch (error) {
+    res.status(401).json({ error: 'Invalid token.' });
+  }
+};
+
+const adminMiddleware = (req, res, next) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Access denied. Admin required.' });
+  }
+  next();
+};
+
+// File upload configuration
+const storage = multer.memoryStorage();
+const upload = multer({
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/') || file.mimetype.startsWith('video/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image and video files allowed'));
+    }
+  }
+});
+
+// ========================
+// ROUTES
+// ========================
+
+// AUTH ROUTES
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { email, password, name } = req.body;
+    
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({ error: 'User already exists' });
+    }
+    
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const user = new User({
+      email,
+      password: hashedPassword,
+      name,
+      provider: 'local'
+    });
+    
+    await user.save();
+    
+    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET || 'your-secret-key');
+    res.status(201).json({
+      token,
+      user: {
+        id: user._id,
+        email: user.email,
+        name: user.name,
+        avatar: user.avatar,
+        role: user.role,
+        isPremium: user.isPremium
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    const user = await User.findOne({ email });
+    if (!user || !await bcrypt.compare(password, user.password)) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    user.lastSeen = new Date();
+    await user.save();
+    
+    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET || 'your-secret-key');
+    res.json({
+      token,
+      user: {
+        id: user._id,
+        email: user.email,
+        name: user.name,
+        avatar: user.avatar,
+        role: user.role,
+        isPremium: user.isPremium
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// USER ROUTES
+app.get('/api/users/profile', authMiddleware, async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id).select('-password');
+    res.json(user);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/users/profile', authMiddleware, async (req, res) => {
+  try {
+    const { name, bio, avatar } = req.body;
+    const user = await User.findById(req.user._id);
+    
+    if (name) user.name = name;
+    if (bio !== undefined) user.bio = bio;
+    if (avatar) user.avatar = avatar;
+    
+    // Calculate profile completion
+    let completion = 20; // base for registration
+    if (user.avatar) completion += 20;
+    if (user.bio) completion += 20;
+    if (user.totalRatings > 0) completion += 20;
+    const listingCount = await Listing.countDocuments({ owner: user._id });
+    if (listingCount > 0) completion += 20;
+    
+    user.profileCompletion = completion;
+    user.updatedAt = new Date();
+    
+    await user.save();
+    res.json(user);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// LISTING ROUTES
+app.get('/api/listings', async (req, res) => {
+  try {
+    const { page = 1, limit = 10, category, search, sort = 'createdAt' } = req.query;
+    const query = { status: 'active' };
+    
+    if (category) query.category = category;
+    if (search) {
+      query.$or = [
+        { title: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } },
+        { tags: { $in: [new RegExp(search, 'i')] } }
+      ];
+    }
+    
+    const listings = await Listing.find(query)
+      .populate('owner', 'name avatar rating')
+      .sort({ [sort]: -1 })
+      .limit(limit * 1)
+      .skip((page - 1) * limit);
+      
+    const total = await Listing.countDocuments(query);
+    
+    res.json({
+      listings,
+      totalPages: Math.ceil(total / limit),
+      currentPage: page,
+      total
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/listings', authMiddleware, upload.array('files', 10), async (req, res) => {
+  try {
+    const { title, description, category, tags, condition, exchangePreferences, location } = req.body;
+    
+    // In production, upload files to cloud storage (AWS S3, Cloudinary, etc.)
+    const images = req.files?.filter(f => f.mimetype.startsWith('image/')).map(f => f.originalname) || [];
+    const video = req.files?.find(f => f.mimetype.startsWith('video/'))?.originalname || '';
+    
+    const listing = new Listing({
+      title,
+      description,
+      category,
+      tags: Array.isArray(tags) ? tags : tags?.split(',') || [],
+      condition,
+      exchangePreferences: Array.isArray(exchangePreferences) ? exchangePreferences : exchangePreferences?.split(',') || [],
+      location: location ? JSON.parse(location) : {},
+      images,
+      video,
+      owner: req.user._id
+    });
+    
+    await listing.save();
+    await listing.populate('owner', 'name avatar rating');
+    
+    res.status(201).json(listing);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/listings/:id', async (req, res) => {
+  try {
+    const listing = await Listing.findById(req.params.id)
+      .populate('owner', 'name avatar rating totalRatings');
+      
+    if (!listing) {
+      return res.status(404).json({ error: 'Listing not found' });
+    }
+    
+    // Increment views
+    listing.views += 1;
+    await listing.save();
+    
+    res.json(listing);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/listings/:id', authMiddleware, async (req, res) => {
+  try {
+    const listing = await Listing.findOne({ _id: req.params.id, owner: req.user._id });
+    if (!listing) {
+      return res.status(404).json({ error: 'Listing not found or not authorized' });
+    }
+    
+    Object.assign(listing, req.body);
+    listing.updatedAt = new Date();
+    await listing.save();
+    
+    res.json(listing);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/listings/:id', authMiddleware, async (req, res) => {
+  try {
+    const listing = await Listing.findOne({ _id: req.params.id, owner: req.user._id });
+    if (!listing) {
+      return res.status(404).json({ error: 'Listing not found or not authorized' });
+    }
+    
+    await listing.deleteOne();
+    res.json({ message: 'Listing deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// TRADE ROUTES
+app.post('/api/trades', authMiddleware, async (req, res) => {
+  try {
+    const { ownerItem, requesterItem, message } = req.body;
+    
+    const ownerItemDoc = await Listing.findById(ownerItem).populate('owner');
+    const requesterItemDoc = await Listing.findById(requesterItem);
+    
+    if (!ownerItemDoc || !requesterItemDoc) {
+      return res.status(404).json({ error: 'Items not found' });
+    }
+    
+    if (ownerItemDoc.owner._id.toString() === req.user._id.toString()) {
+      return res.status(400).json({ error: 'Cannot trade with yourself' });
+    }
+    
+    const trade = new Trade({
+      requester: req.user._id,
+      owner: ownerItemDoc.owner._id,
+      requesterItem,
+      ownerItem,
+      message,
+      chatRoom: `trade_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+    });
+    
+    await trade.save();
+    
+    // Create notification
+    const notification = new Notification({
+      recipient: ownerItemDoc.owner._id,
+      sender: req.user._id,
+      type: 'trade_request',
+      title: 'New Trade Request',
+      message: `${req.user.name} wants to trade for your ${ownerItemDoc.title}`,
+      data: { tradeId: trade._id }
+    });
+    await notification.save();
+    
+    // Emit socket event
+    io.to(`user_${ownerItemDoc.owner._id}`).emit('notification', notification);
+    
+    res.status(201).json(trade);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/trades', authMiddleware, async (req, res) => {
+  try {
+    const trades = await Trade.find({
+      $or: [{ requester: req.user._id }, { owner: req.user._id }]
+    })
+    .populate('requester', 'name avatar')
+    .populate('owner', 'name avatar')
+    .populate('requesterItem', 'title images')
+    .populate('ownerItem', 'title images')
+    .sort({ createdAt: -1 });
+    
+    res.json(trades);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/trades/:id/status', authMiddleware, async (req, res) => {
+  try {
+    const { status } = req.body;
+    const trade = await Trade.findOne({
+      _id: req.params.id,
+      $or: [{ requester: req.user._id }, { owner: req.user._id }]
+    }).populate('requester owner');
+    
+    if (!trade) {
+      return res.status(404).json({ error: 'Trade not found' });
+    }
+    
+    trade.status = status;
+    trade.updatedAt = new Date();
+    await trade.save();
+    
+    // Create notification
+    const otherUser = trade.requester._id.toString() === req.user._id.toString() 
+      ? trade.owner : trade.requester;
+      
+    const notification = new Notification({
+      recipient: otherUser._id,
+      sender: req.user._id,
+      type: `trade_${status}`,
+      title: `Trade ${status.charAt(0).toUpperCase() + status.slice(1)}`,
+      message: `Your trade has been ${status}`,
+      data: { tradeId: trade._id }
+    });
+    await notification.save();
+    
+    io.to(`user_${otherUser._id}`).emit('notification', notification);
+    
+    res.json(trade);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// MESSAGE ROUTES
+app.get('/api/trades/:tradeId/messages', authMiddleware, async (req, res) => {
+  try {
+    const trade = await Trade.findOne({
+      _id: req.params.tradeId,
+      $or: [{ requester: req.user._id }, { owner: req.user._id }]
+    });
+    
+    if (!trade) {
+      return res.status(404).json({ error: 'Trade not found' });
+    }
+    
+    const messages = await Message.find({ tradeId: req.params.tradeId })
+      .populate('sender', 'name avatar')
+      .sort({ createdAt: 1 });
+    
+    res.json(messages);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/trades/:tradeId/messages', authMiddleware, async (req, res) => {
+  try {
+    const { content, type = 'text' } = req.body;
+    
+    const trade = await Trade.findOne({
+      _id: req.params.tradeId,
+      $or: [{ requester: req.user._id }, { owner: req.user._id }]
+    }).populate('requester owner');
+    
+    if (!trade) {
+      return res.status(404).json({ error: 'Trade not found' });
+    }
+    
+    const message = new Message({
+      tradeId: req.params.tradeId,
+      sender: req.user._id,
+      content,
+      type
+    });
+    
+    await message.save();
+    await message.populate('sender', 'name avatar');
+    
+    // Emit to trade room
+    io.to(trade.chatRoom).emit('message', message);
+    
+    // Create notification for other user
+    const otherUser = trade.requester._id.toString() === req.user._id.toString() 
+      ? trade.owner : trade.requester;
+      
+    const notification = new Notification({
+      recipient: otherUser._id,
+      sender: req.user._id,
+      type: 'message',
+      title: 'New Message',
+      message: `${req.user.name} sent you a message`,
+      data: { tradeId: trade._id }
+    });
+    await notification.save();
+    
+    io.to(`user_${otherUser._id}`).emit('notification', notification);
+    
+    res.status(201).json(message);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// NOTIFICATION ROUTES
+app.get('/api/notifications', authMiddleware, async (req, res) => {
+  try {
+    const notifications = await Notification.find({ recipient: req.user._id })
+      .populate('sender', 'name avatar')
+      .sort({ createdAt: -1 })
+      .limit(50);
+    
+    res.json(notifications);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/notifications/:id/read', authMiddleware, async (req, res) => {
+  try {
+    await Notification.findOneAndUpdate(
+      { _id: req.params.id, recipient: req.user._id },
+      { read: true }
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PAYMENT ROUTES
+app.post('/api/payments/create-intent', authMiddleware, async (req, res) => {
+  try {
+    const { amount, currency = 'usd', type = 'premium' } = req.body;
+    
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: amount * 100, // Convert to cents
+      currency,
+      metadata: {
+        userId: req.user._id.toString(),
+        type
+      }
+    });
+    
+    res.json({ clientSecret: paymentIntent.client_secret });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/payments/webhook', express.raw({type: 'application/json'}), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+  
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    return res.status(400).send(`Webhook signature verification failed.`);
+  }
+  
+  if (event.type === 'payment_intent.succeeded') {
+    const paymentIntent = event.data.object;
+    const userId = paymentIntent.metadata.userId;
+    const type = paymentIntent.metadata.type;
+    
+    if (type === 'premium') {
+      await User.findByIdAndUpdate(userId, {
+        isPremium: true,
+        premiumExpiry: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // 30 days
+      });
+    }
+  }
+  
+  res.json({ received: true });
+});
+
+// REVIEW ROUTES
+app.post('/api/reviews', authMiddleware, async (req, res) => {
+  try {
+    const { tradeId, rating, comment } = req.body;
+    
+    const trade = await Trade.findOne({
+      _id: tradeId,
+      status: 'completed',
+      $or: [{ requester: req.user._id }, { owner: req.user._id }]
+    });
+    
+    if (!trade) {
+      return res.status(404).json({ error: 'Completed trade not found' });
+    }
+    
+    const reviewed = trade.requester.toString() === req.user._id.toString() 
+      ? trade.owner : trade.requester;
+    
+    // Check if review already exists
+    const existingReview = await Review.findOne({
+      trade: tradeId,
+      reviewer: req.user._id
+    });
+    
+    if (existingReview) {
+      return res.status(400).json({ error: 'Review already submitted' });
+    }
+    
+    const review = new Review({
+      trade: tradeId,
+      reviewer: req.user._id,
+      reviewed,
+      rating,
+      comment
+    });
+    
+    await review.save();
+    
+    // Update user rating
+    const user = await User.findById(reviewed);
+    const totalRating = (user.rating * user.totalRatings) + rating;
+    user.totalRatings += 1;
+    user.rating = totalRating / user.totalRatings;
+    await user.save();
+    
+    res.status(201).json(review);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ========================
+// SOCKET.IO HANDLERS
+// ========================
+
+io.on('connection', (socket) => {
+  console.log('User connected:', socket.id);
+  
+  socket.on('join_user_room', (userId) => {
+    socket.join(`user_${userId}`);
+  });
+  
+  socket.on('join_trade_room', (tradeRoom) => {
+    socket.join(tradeRoom);
+  });
+  
+  socket.on('typing', ({ tradeRoom, userName, isTyping }) => {
+    socket.to(tradeRoom).emit('user_typing', { userName, isTyping });
+  });
+  
+  socket.on('disconnect', () => {
+    console.log('User disconnected:', socket.id);
+  });
+});
+
+// ========================
+// SERVER STARTUP
+// ========================
+
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+// ========================
+// FRONTEND - React App (App.js)
+// ========================
+
+import React, { useState, useEffect, createContext, useContext } from 'react';
+import axios from 'axios';
+import io from 'socket.io-client';
+import { 
+  BrowserRouter as Router, 
+  Routes, 
+  Route, 
+  Navigate,
+  useNavigate
+} from 'react-router-dom';
+
+// Context
+const AuthContext = createContext();
+const ThemeContext = createContext();
+
+// API Configuration
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000/api';
+axios.defaults.baseURL = API_BASE_URL;
+
+// Axios interceptor for auth
+axios.interceptors.request.use((config) => {
+  const token = localStorage.getItem('token');
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+// Theme Provider
+const ThemeProvider = ({ children }) => {
+  const [isDark, setIsDark] = useState(() => 
+    localStorage.getItem('theme') === 'dark' || 
+    window.matchMedia('(prefers-color-scheme: dark)').matches
+  );
+
+  useEffect(() => {
+    localStorage.setItem('theme', isDark ? 'dark' : 'light');
+    document.documentElement.classList.toggle('dark', isDark);
+  }, [isDark]);
+
+  return (
+    <ThemeContext.Provider value={{ isDark, setIsDark }}>
+      {children}
+    </ThemeContext.Provider>
+  );
+};
+
+// Auth Provider
+const AuthProvider = ({ children }) => {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [socket, setSocket] = useState(null);
+
+  useEffect(() => {
+    const token = localStorage.getItem('token');
+    if (token) {
+      axios.get('/users/profile')
+        .then(response => {
+          setUser(response.data);
+          // Initialize socket connection
+          const socketConnection = io(process.env.REACT_APP_SOCKET_URL || 'http://localhost:5000');
+          socketConnection.emit('join_user_room', response.data._id);
+          setSocket(socketConnection);
+        })
+        .catch(() => {
+          localStorage.removeItem('token');
+        })
+        .finally(() => setLoading(false));
+    } else {
+      setLoading(false);
+    }
+  }, []);
+
+  const login = async (email, password) => {
+    const response = await axios.post('/auth/login', { email, password });
+    localStorage.setItem('token', response.data.token);
+    setUser(response.data.user);
+    
+    const socketConnection = io(process.env.REACT_APP_SOCKET_URL || 'http://localhost:5000');
+    socketConnection.emit('join_user_room', response.data.user.id);
+    setSocket(socketConnection);
+    
+    return response.data;
+  };
+
+  const register = async (email, password, name) => {
+    const response = await axios.post('/auth/register', { email, password, name });
+    localStorage.setItem('token', response.data.token);
+    setUser(response.data.user);
+    return response.data;
+  };
+
+  const logout = () => {
+    localStorage.removeItem('
